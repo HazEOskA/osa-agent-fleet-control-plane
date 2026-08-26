@@ -3,14 +3,26 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+const DEFAULT_GEMINI_REQUEST_TIMEOUT_MS = 90_000;
+
+export function getGeminiRequestTimeoutMs(): number {
+  const configured = Number.parseInt(process.env.GEMINI_REQUEST_TIMEOUT_MS || '', 10);
+  if (Number.isFinite(configured) && configured >= 5_000) {
+    return configured;
+  }
+  return DEFAULT_GEMINI_REQUEST_TIMEOUT_MS;
+}
+
 export function getGeminiClient(): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     return null;
   }
+
   return new GoogleGenAI({
     apiKey,
     httpOptions: {
+      timeout: getGeminiRequestTimeoutMs(),
       headers: {
         'User-Agent': 'aistudio-build',
       },
@@ -22,7 +34,7 @@ export interface ChatMessagePayload {
   role: 'user' | 'model';
   text: string;
   images?: Array<{
-    data: string; // base64 without header or with header
+    data: string;
     mimeType: string;
   }>;
 }
@@ -48,13 +60,11 @@ export async function handleGeminiStream(
 
   const modelName = options.model || 'gemini-3.7-flash';
 
-  // Format messages into Gemini contents format
   const contents = options.messages.map((msg) => {
     const parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
 
     if (msg.images && msg.images.length > 0) {
       for (const img of msg.images) {
-        // Strip data:image/...;base64, if present
         const cleanBase64 = img.data.replace(/^data:[^;]+;base64,/, '');
         parts.push({
           inlineData: {
@@ -75,7 +85,15 @@ export async function handleGeminiStream(
     };
   });
 
-  const config: Record<string, unknown> = {};
+  const config: Record<string, unknown> = {
+    httpOptions: {
+      timeout: getGeminiRequestTimeoutMs(),
+    },
+  };
+
+  if (signal) {
+    config.abortSignal = signal;
+  }
 
   if (options.systemInstruction && options.systemInstruction.trim()) {
     config.systemInstruction = options.systemInstruction.trim();
@@ -99,6 +117,10 @@ export async function handleGeminiStream(
     config.tools = [{ googleSearch: {} }];
   }
 
+  if (signal?.aborted) {
+    throw new Error('Gemini request was aborted before it started.');
+  }
+
   const responseStream = await ai.models.generateContentStream({
     model: modelName,
     contents,
@@ -107,8 +129,9 @@ export async function handleGeminiStream(
 
   for await (const chunk of responseStream) {
     if (signal?.aborted) {
-      break;
+      throw new Error('Gemini request was aborted.');
     }
+
     const text = chunk.text;
     const grounding = chunk.candidates?.[0]?.groundingMetadata;
     onChunk({ text, grounding });
