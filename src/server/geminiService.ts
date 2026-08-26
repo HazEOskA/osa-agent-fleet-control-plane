@@ -4,6 +4,10 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const DEFAULT_GEMINI_REQUEST_TIMEOUT_MS = 90_000;
+const PRIMARY_MODEL = 'gemini-3.7-flash';
+const FALLBACK_MODEL = 'gemini-3.1-flash-lite';
+const RETRYABLE_STATUS_CODES = new Set([429, 503]);
+const RETRY_DELAYS_MS = [1_000, 2_000, 4_000] as const;
 
 export function getGeminiRequestTimeoutMs(): number {
   const configured = Number.parseInt(process.env.GEMINI_REQUEST_TIMEOUT_MS || '', 10);
@@ -48,19 +52,97 @@ export interface ChatRequestOptions {
   useSearch?: boolean;
 }
 
-export async function handleGeminiStream(
-  options: ChatRequestOptions,
-  onChunk: (chunk: { text?: string; grounding?: unknown }) => void,
-  signal?: AbortSignal
-) {
-  const ai = getGeminiClient();
-  if (!ai) {
-    throw new Error('GEMINI_API_KEY is not configured in the server environment.');
+type StreamChunk = { text?: string; grounding?: unknown };
+
+function getNumericStatus(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isInteger(value)) {
+    return value;
+  }
+  if (typeof value === 'string' && /^\d{3}$/.test(value)) {
+    return Number.parseInt(value, 10);
+  }
+  return undefined;
+}
+
+function extractStatusCode(error: unknown): number | undefined {
+  if (!error || typeof error !== 'object') {
+    return undefined;
   }
 
-  const modelName = options.model || 'gemini-3.7-flash';
+  const candidate = error as Record<string, unknown>;
+  const direct =
+    getNumericStatus(candidate.code) ??
+    getNumericStatus(candidate.statusCode) ??
+    getNumericStatus(candidate.status);
 
-  const contents = options.messages.map((msg) => {
+  if (direct) {
+    return direct;
+  }
+
+  const response = candidate.response;
+  if (response && typeof response === 'object') {
+    const responseStatus = getNumericStatus((response as Record<string, unknown>).status);
+    if (responseStatus) {
+      return responseStatus;
+    }
+  }
+
+  return undefined;
+}
+
+function extractStatusCodeFromMessage(error: unknown): number | undefined {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  const codeMatch = message.match(/\"code\"\s*:\s*(429|503)/);
+  if (codeMatch) {
+    return Number.parseInt(codeMatch[1], 10);
+  }
+
+  if (/\b429\b/.test(message)) return 429;
+  if (/\b503\b/.test(message)) return 503;
+  return undefined;
+}
+
+function getRetryableStatusCode(error: unknown): number | undefined {
+  const status = extractStatusCode(error) ?? extractStatusCodeFromMessage(error);
+  return status && RETRYABLE_STATUS_CODES.has(status) ? status : undefined;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+
+  const reason = signal.reason;
+  if (reason instanceof Error) {
+    throw reason;
+  }
+  throw new Error('Gemini request was aborted.');
+}
+
+async function sleepWithAbort(delayMs: number, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, delayMs);
+
+    const onAbort = () => {
+      cleanup();
+      const reason = signal?.reason;
+      reject(reason instanceof Error ? reason : new Error('Gemini request was aborted.'));
+    };
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+    };
+
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function buildContents(messages: ChatMessagePayload[]) {
+  return messages.map((msg) => {
     const parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
 
     if (msg.images && msg.images.length > 0) {
@@ -84,7 +166,9 @@ export async function handleGeminiStream(
       parts,
     };
   });
+}
 
+function buildConfig(options: ChatRequestOptions, signal?: AbortSignal): GenerateContentConfig {
   const config: GenerateContentConfig = {
     httpOptions: {
       timeout: getGeminiRequestTimeoutMs(),
@@ -117,23 +201,87 @@ export async function handleGeminiStream(
     config.tools = [{ googleSearch: {} }];
   }
 
-  if (signal?.aborted) {
-    throw new Error('Gemini request was aborted before it started.');
+  return config;
+}
+
+export async function handleGeminiStream(
+  options: ChatRequestOptions,
+  onChunk: (chunk: StreamChunk) => void,
+  signal?: AbortSignal
+) {
+  const ai = getGeminiClient();
+  if (!ai) {
+    throw new Error('GEMINI_API_KEY is not configured in the server environment.');
   }
 
-  const responseStream = await ai.models.generateContentStream({
-    model: modelName,
-    contents,
-    config,
-  });
+  const selectedModel = options.model || PRIMARY_MODEL;
+  const modelCandidates =
+    selectedModel === PRIMARY_MODEL ? [PRIMARY_MODEL, FALLBACK_MODEL] : [selectedModel];
+  const contents = buildContents(options.messages);
+  const config = buildConfig(options, signal);
 
-  for await (const chunk of responseStream) {
-    if (signal?.aborted) {
-      throw new Error('Gemini request was aborted.');
+  let lastError: unknown;
+
+  for (let modelIndex = 0; modelIndex < modelCandidates.length; modelIndex += 1) {
+    const modelName = modelCandidates[modelIndex];
+
+    for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt += 1) {
+      throwIfAborted(signal);
+      let emittedAnyChunk = false;
+
+      try {
+        const responseStream = await ai.models.generateContentStream({
+          model: modelName,
+          contents,
+          config,
+        });
+
+        for await (const chunk of responseStream) {
+          throwIfAborted(signal);
+          const text = chunk.text;
+          const grounding = chunk.candidates?.[0]?.groundingMetadata;
+
+          if (text || grounding) {
+            emittedAnyChunk = true;
+          }
+          onChunk({ text, grounding });
+        }
+
+        return;
+      } catch (error: unknown) {
+        lastError = error;
+        throwIfAborted(signal);
+
+        const retryableStatus = getRetryableStatusCode(error);
+        if (!retryableStatus || emittedAnyChunk) {
+          throw error;
+        }
+
+        const hasRetryRemaining = attempt < RETRY_DELAYS_MS.length;
+        if (hasRetryRemaining) {
+          const delayMs = RETRY_DELAYS_MS[attempt];
+          console.warn(
+            `Gemini ${modelName} returned ${retryableStatus}; retrying in ${delayMs} ms (attempt ${attempt + 2}/${RETRY_DELAYS_MS.length + 1}).`
+          );
+          await sleepWithAbort(delayMs, signal);
+          continue;
+        }
+
+        const hasFallback = modelIndex < modelCandidates.length - 1;
+        if (hasFallback) {
+          const fallbackModel = modelCandidates[modelIndex + 1];
+          console.warn(
+            `Gemini ${modelName} remained unavailable after bounded retries; falling back to ${fallbackModel}.`
+          );
+          break;
+        }
+
+        throw error;
+      }
     }
-
-    const text = chunk.text;
-    const grounding = chunk.candidates?.[0]?.groundingMetadata;
-    onChunk({ text, grounding });
   }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('Gemini generation failed after retries and fallback.');
 }
