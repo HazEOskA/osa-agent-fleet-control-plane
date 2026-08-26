@@ -5,12 +5,11 @@ import { createApiMiddleware } from './src/server/apiMiddleware';
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const parsedPort = Number.parseInt(process.env.PORT || '8080', 10);
+  const PORT = Number.isFinite(parsedPort) && parsedPort > 0 ? parsedPort : 8080;
 
-  // API routes FIRST
   app.use(createApiMiddleware());
 
-  // Vite middleware for development
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -26,8 +25,11 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`Server running on port ${PORT}`);
   });
 }
 
-startServer();
+startServer().catch((error) => {
+  console.error('Failed to start server:', error);
+  process.exit(1);
+});
