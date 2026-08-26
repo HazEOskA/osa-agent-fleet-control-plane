@@ -1,0 +1,6 @@
+{
+  "name": "Gemini AI Studio",
+  "description": "An interactive AI workspace powered by Gemini 3.7 Flash for conversational reasoning, creative drafting, coding assistance, and prompt engineering.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
