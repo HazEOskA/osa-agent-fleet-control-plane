@@ -1,4 +1,4 @@
-import { GoogleGenAI, ThinkingLevel } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, type GenerateContentConfig } from '@google/genai';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -85,7 +85,7 @@ export async function handleGeminiStream(
     };
   });
 
-  const config: Record<string, unknown> = {
+  const config: GenerateContentConfig = {
     httpOptions: {
       timeout: getGeminiRequestTimeoutMs(),
     },
