@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'http';
+import { authorizeFleetRequest } from './fleetAuth';
 import {
   handleGeminiStream,
   getGeminiClient,
@@ -31,6 +32,12 @@ export function createApiMiddleware() {
     }
 
     if (url === '/api/chat' && req.method === 'POST') {
+      const auth = authorizeFleetRequest(req.headers.authorization, process.env.OSA_FLEET_SERVICE_TOKEN);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ error: auth.code }));
+        return;
+      }
       let body = '';
 
       req.on('data', (chunk) => {
@@ -105,6 +112,7 @@ export function createApiMiddleware() {
           );
 
           if (!res.writableEnded && !res.destroyed) {
+            res.write('data: {"type":"done"}\n\n');
             res.write('data: [DONE]\n\n');
             res.end();
           }
@@ -120,14 +128,10 @@ export function createApiMiddleware() {
 
           if (!res.headersSent) {
             res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'SERVER_ERROR', message }));
+            res.end(JSON.stringify({ error: 'SERVER_ERROR', message: 'Model generation failed.' }));
           } else if (!res.writableEnded && !res.destroyed) {
-            res.write(
-              `data: ${JSON.stringify({
-                text: `\n\nGeneration failed: ${message}`,
-              })}\n\n`
-            );
-            res.write('data: [DONE]\n\n');
+            // Never encode upstream failure as normal chat text.
+            res.write(`data: ${JSON.stringify({ type: 'error', error: { code: 'GENERATION_FAILED', message: 'Model generation failed.' } })}\n\n`);
             res.end();
           }
         } finally {
