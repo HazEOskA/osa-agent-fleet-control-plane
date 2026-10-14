@@ -333,7 +333,8 @@ export default function App() {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+        buffer += decoder.decode(value, { stream: true });
+        buffer = buffer.replace(/\r\n/g, '\n');
         const blocks = buffer.split('\n\n');
         buffer = blocks.pop() || '';
         for (const block of blocks) {
