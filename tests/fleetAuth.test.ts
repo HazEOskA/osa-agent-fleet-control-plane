@@ -38,7 +38,8 @@ test('Browser session requires correct signature, same origin and unexpired cook
   assert.equal(verifyOperatorCookie(cookie, token, now + 1000), true);
   assert.equal(verifyOperatorCookie(cookie, 'different-super-secret-service-token-value', now + 1000), false);
   assert.equal(verifyOperatorCookie(cookie, token, now + 8 * 60 * 60 * 1000), false);
-  assert.equal(verifyOperatorCookie(cookie.replace(/.$/, '0'), token, now + 1000), false);
+  const last = cookie.slice(-1);
+  assert.equal(verifyOperatorCookie(cookie.slice(0, -1) + (last === '0' ? '1' : '0'), token, now + 1000), false);
   assert.match(clearOperatorCookie(true), /Max-Age=0/);
   assert.equal(sameOrigin('https://fleet.example', 'fleet.example'), true);
   assert.equal(sameOrigin('https://evil.example', 'fleet.example'), false);
