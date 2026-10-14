@@ -32,6 +32,7 @@ import { MessageComposer } from './components/MessageComposer';
 import { SettingsModal } from './components/SettingsModal';
 import { PromptLibraryModal } from './components/PromptLibraryModal';
 import { ScratchpadDrawer } from './components/ScratchpadDrawer';
+import { FleetLogin } from './components/FleetLogin';
 
 const STORAGE_SESSIONS_KEY = 'gemini_studio_sessions_v1';
 const STORAGE_ACTIVE_ID_KEY = 'gemini_studio_active_session_v1';
@@ -105,6 +106,7 @@ export default function App() {
   // Runtime status
   const [hasApiKey, setHasApiKey] = useState<boolean>(true);
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
+  const [authenticated, setAuthenticated] = useState<boolean | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
   // Save sessions to localStorage
@@ -133,6 +135,16 @@ export default function App() {
       // Fallback
     }
   }, [notes]);
+
+  // Browser uses a same-origin, HttpOnly operator session, never the Fleet service bearer.
+  useEffect(() => {
+    let active = true;
+    fetch('/api/session', { credentials: 'same-origin' })
+      .then(res => res.json())
+      .then(data => { if (active) setAuthenticated(data.authenticated === true); })
+      .catch(() => { if (active) setAuthenticated(false); });
+    return () => { active = false; };
+  }, []);
 
   // Check health endpoint
   useEffect(() => {
@@ -289,6 +301,7 @@ export default function App() {
 
       const res = await fetch('/api/chat', {
         method: 'POST',
+        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           messages: payloadMessages,
@@ -303,6 +316,7 @@ export default function App() {
       });
 
       if (!res.ok) {
+        if (res.status === 401) setAuthenticated(false);
         const errorData = await res.json().catch(() => ({}));
         throw new Error(errorData.message || `Server responded with ${res.status}`);
       }
@@ -313,58 +327,40 @@ export default function App() {
       let accumulatedThinking = '';
       let groundingData: unknown = undefined;
 
-      if (reader) {
-        let buffer = '';
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n\n');
-          buffer = lines.pop() || '';
-
-          for (const block of lines) {
-            const line = block.trim();
-            if (!line.startsWith('data:')) continue;
-            const dataStr = line.replace(/^data:\s*/, '');
-
-            if (dataStr === '[DONE]') {
-              break;
-            }
-
-            try {
-              const parsed = JSON.parse(dataStr);
-              if (parsed.error) {
-                throw new Error(parsed.error);
-              }
-              if (parsed.text) {
-                accumulatedText += parsed.text;
-              }
-              if (parsed.grounding) {
-                groundingData = parsed.grounding;
-              }
-
-              // Update in-place
-              updateActiveSession((s) => ({
-                ...s,
-                messages: s.messages.map((m) =>
-                  m.id === modelMessageId
-                    ? {
-                        ...m,
-                        text: accumulatedText,
-                        groundingMetadata: groundingData as ChatMessage['groundingMetadata'],
-                        isStreaming: true,
-                      }
-                    : m
-                ),
-              }));
-            } catch (jsonErr) {
-              console.warn('Failed to parse SSE JSON chunk:', jsonErr);
-            }
-          }
+      let terminal = false;
+      if (!reader) throw new Error('Fleet returned no response stream');
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+        const blocks = buffer.split('\n\n');
+        buffer = blocks.pop() || '';
+        for (const block of blocks) {
+          const dataLine = block.split('\n').find(line => line.startsWith('data:'));
+          if (!dataLine) continue;
+          const dataStr = dataLine.slice(5).trim();
+          if (dataStr === '[DONE]') { terminal = true; continue; }
+          let parsed: { type?: string; error?: { code?: string } | string; text?: string; grounding?: unknown };
+          try { parsed = JSON.parse(dataStr); }
+          catch { throw new Error('Invalid Fleet SSE JSON'); }
+          if (parsed.type === 'error' || parsed.error) throw new Error('Fleet generation failed');
+          if (parsed.type === 'done') { terminal = true; continue; }
+          if (terminal) throw new Error('Unexpected Fleet data after completion');
+          if (parsed.text) accumulatedText += parsed.text;
+          if (parsed.grounding) groundingData = parsed.grounding;
+          updateActiveSession((s) => ({
+            ...s,
+            messages: s.messages.map(m => m.id === modelMessageId ? {
+              ...m, text: accumulatedText,
+              groundingMetadata: groundingData as ChatMessage['groundingMetadata'],
+              isStreaming: true,
+            } : m),
+          }));
         }
       }
-
+      if (!terminal || !accumulatedText.trim()) throw new Error('Incomplete Fleet response');
+      
       // Finish streaming successfully
       updateActiveSession((s) => ({
         ...s,
@@ -428,6 +424,11 @@ export default function App() {
     }
     handleSendMessage(tpl.prompt, []);
   };
+
+  if (authenticated === null) {
+    return <div className="grid min-h-screen place-items-center bg-neutral-950 text-neutral-100">Checking Fleet operator session…</div>;
+  }
+  if (!authenticated) return <FleetLogin onAuthenticated={() => setAuthenticated(true)} />;
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-neutral-100 font-sans text-neutral-900 antialiased">
