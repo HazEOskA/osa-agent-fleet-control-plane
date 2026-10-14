@@ -80,7 +80,7 @@ export function createApiMiddleware() {
         let oversized = false;
         req.on('data', chunk => {
           body += chunk;
-          if (body.length > 4096) { oversized = true; req.pause(); reply(413, { error: 'BODY_TOO_LARGE' }); }
+          if (!oversized && body.length > 4096) { oversized = true; body = ''; reply(413, { error: 'BODY_TOO_LARGE' }); }
         });
         req.on('end', () => {
           if (oversized || res.writableEnded) return;
@@ -106,7 +106,7 @@ export function createApiMiddleware() {
       const operatorSession = sameOrigin(req.headers.origin, req.headers.host) &&
         operatorAuthConfigured(process.env.OSA_FLEET_SERVICE_TOKEN, process.env.OSA_FLEET_OPERATOR_PASSWORD) &&
         verifyOperatorCookie(req.headers.cookie, process.env.OSA_FLEET_SERVICE_TOKEN);
-      if (!auth.ok && !operatorSession) {
+      if (auth.ok === false && !operatorSession) {
         res.writeHead(auth.status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify({ error: auth.code }));
         return;
